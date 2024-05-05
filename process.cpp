@@ -27,6 +27,7 @@ enum class MessageType {
     ClientMessage,
     GetChatLog,
     CrashProcess,
+    CrashNotice,
     Unknown
 };
 
@@ -75,6 +76,7 @@ private:
     std::vector<std::thread> threads;
     std::atomic<bool> runningHeartbeatTimer{false};
     std::thread heartbeat_thread;
+    std::unordered_map<int, bool> node_status;
     std::vector<LogEntry> log;
     std::mt19937 rng{std::random_device{}()};
     std::uniform_int_distribution<std::mt19937::result_type> dist{1500, 3000};
@@ -169,7 +171,11 @@ private:
 
 public:
     RaftNode(int id, int n_process, int port)
-    :state(NodeState::Follower), term(0), id(id), port(port), n_process(n_process), base_port(port - id), vote_for(-1), stop(false){}
+    :state(NodeState::Follower), term(0), id(id), port(port), n_process(n_process), base_port(port - id), vote_for(-1), stop(false){
+        for (int i = 0; i < n_process; i++) {
+            node_status[i] = true;
+        }
+    }
 
     ~RaftNode() {
         for(auto& th : threads) {
@@ -262,6 +268,10 @@ public:
         }
         else if (command == "crash") {
             msg.type = MessageType::CrashProcess;
+        }
+        else if (command == "CrashNotice") {
+            msg.type = MessageType::CrashNotice;
+            iss >> msg.senderID;
         }
         else {
             msg.type = MessageType::Unknown;
@@ -417,6 +427,7 @@ public:
                 int current_index = log.size() - 1;
 
                 for(int i = 0; i < n_process; i++) {
+                    if(node_status[i] == false) continue;
                     if(i != id) {
                         sendAppendEntries(i, false);
                     }
@@ -435,9 +446,26 @@ public:
     }
 
     void handleCrashProcess() {
-
+        for (int i = 0; i < n_process; i++) {
+            if (node_status[i] == false) continue;
+            std::string message = "CrashNotice " + std::to_string(id);
+            sendMessageToNode(i, message);
+        }
+        stop = true;
+        stopHeartbeatTimer();
+        for(auto& th : threads) {
+            if (th.joinable()) {
+                th.join();
+            }
+        }
+        if (heartbeat_thread.joinable()) {
+            heartbeat_thread.join(); 
+        }
     }
 
+    void handleCrashNotice(const Message& msg) {
+        node_status[msg.senderID] = false;
+    }
     void handleConnection(int sock) {
         char buffer[1024] {0};
         read(sock, buffer, 1024);
@@ -464,6 +492,9 @@ public:
                 break;
             case MessageType::CrashProcess:
                 handleCrashProcess();
+                break;
+            case MessageType::CrashNotice:
+                handleCrashNotice(msg);
                 break;
             default:
                 std::cerr << id << ": received unknown message type." << std::endl;
@@ -494,7 +525,8 @@ public:
         if (state != NodeState::Leader) {
             return;
         }
-        for(int i = 0; i < n_process; i++) {
+        for (int i = 0; i < n_process; i++) {
+            if (node_status[i] == false) continue;
             if (i != id) {
                 sendAppendEntries(i, true);
             }
@@ -555,6 +587,7 @@ public:
         }
         std::cout << id << ": requesting votes for term " << term << std::endl;
         for(int i = 0; i < n_process; i++){
+            if (node_status[i] == false) continue;
             if(i != id) {
                 sendRequestVote(i);
             }
