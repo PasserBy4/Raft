@@ -114,7 +114,7 @@ private:
     void sendMessageToNode(int node_id, const std::string& message, bool close_immediately = true, int timeout_ms = 1000, int max_retries = 3) {
         std::string state_str = (state == NodeState::Follower) ? "Follower" :
                                 (state == NodeState::Candidate) ? "Candidate" : "Leader";
-        std::cout << "Node " << id << " (State: " << state_str << ", Term: " << term << ") sending message to node " << node_id << " : " << message<< std::endl;
+        // std::cout << "Node " << id << " (State: " << state_str << ", Term: " << term << ") sending message to node " << node_id << " : " << message<< std::endl;
 
         std::string ip = "127.0.0.1";
         int port = base_port + node_id;
@@ -232,9 +232,7 @@ public:
         std::istringstream iss(buffer);
         std::string command;
         iss >> command;
-
         Message msg;
-
         if (command == "RequestVote") {
             msg.type = MessageType::RequestVote;
             iss >> msg.senderID >> msg.term >> msg.messageID;
@@ -256,6 +254,7 @@ public:
             iss >> msg.senderID >> msg.term >> msg.content;
         }
         else if (command == "msg") {
+            std::cout << "msg!!!\n";
             msg.type = MessageType::ClientMessage;
             iss >> msg.messageID;
             std::getline(iss, msg.content);
@@ -263,8 +262,9 @@ public:
                 msg.content.erase(0, 1);
             }
         }
-        else if (command == "get" && iss >> command && command == "chatLog") {
+        else if (command == "get") {
             msg.type = MessageType::GetChatLog;
+            std::cout << "get chatlog!!!";
         }
         else if (command == "crash") {
             msg.type = MessageType::CrashProcess;
@@ -363,7 +363,7 @@ public:
                     // std::string state_str = (state == NodeState::Follower) ? "Follower" :
                     //         (state == NodeState::Candidate) ? "Candidate" : "Leader";
                     // std::cout << "Node " << id << " (State: " << state_str << ", Term: " << term << ")"  << std::endl;
-                    std::cout << id << ": received heartbeat from node " << msg.senderID << std::endl;
+                    // std::cout << id << ": received heartbeat from node " << msg.senderID << std::endl;
                     sendAppendEntriesResponse(msg.senderID, true);
                 }
                 else {
@@ -415,7 +415,7 @@ public:
     void applyLogToStateMachine(int index) {
         if (index < log.size() && log[index].term == term) {
             state_machine.apply(log[index].command);
-            std::cout << id << ": log entry applied at index " << index << ": " << log[index].command << std::endl;
+            // std::cout << id << ": log entry applied at index " << index << ": " << log[index].command << std::endl;
         }
     }
 
@@ -435,14 +435,40 @@ public:
 
                 log_cv.wait(lock, [this, current_index](){return log[current_index].confirmations > n_process / 2; });
                 applyLogToStateMachine(current_index);
+            } else {
+                // Redirect message to the leader
+                if (leader_id != -1) {
+                    sendMessageToNode(leader_id, "msg " + std::to_string(msg.messageID) + " " + msg.content);
+                } else {
+                    std::cerr << id << ": No leader is elected. Unable to redirect message." << std::endl;
+                }
             }
         } catch (const std::exception& e) {
             std::cerr << "Exception in handleClientMessage: " << e.what() << std::endl;
         }
     }
 
-    void hamdleGetChatLog(int sock) {
+    void handleGetChatLog(int sock) {
+        std::ostringstream oss;
 
+        for (const auto& message : state_machine.chat_history) {
+            if (oss.tellp() > 0) {
+                oss << ",";
+            }
+            oss << message;
+        }
+        
+        std::string chatLog = oss.str();
+        std::cout << "Handling get chatlog" << "\n";
+        std::cout << chatLog;
+        chatLog += "\n";
+        ssize_t bytes_sent = send(sock, chatLog.c_str(), chatLog.size(), 0);
+        
+        if (bytes_sent < 0) {
+            std::cerr << "Failed to send chat log to requester." << std::endl;
+        } else {
+            std::cout << "Sent chat log successfully." << std::endl;
+        }
     }
 
     void handleCrashProcess() {
@@ -470,7 +496,6 @@ public:
         char buffer[1024] {0};
         read(sock, buffer, 1024);
         Message msg = parseMessage(buffer);
-
         switch(msg.type) {
             case MessageType::RequestVote:
                 handleRequestVote(msg, sock);
@@ -488,7 +513,7 @@ public:
                 handleClientMessage(msg);
                 break;
             case MessageType::GetChatLog:
-                hamdleGetChatLog(sock);
+                handleGetChatLog(sock);
                 break;
             case MessageType::CrashProcess:
                 handleCrashProcess();
