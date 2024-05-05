@@ -72,7 +72,7 @@ class ClientHandler(Thread):
 
     def send(self, s):
         if self.valid:
-            self.sock.send(str(s) + '\n')
+            self.sock.send((str(s) + '\n').encode('utf-8'))
 
     def close(self):
         try:
