@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <random> 
+#include <cmath>
 #include <cstring>
 #include <unistd.h>
 
@@ -28,6 +29,7 @@ enum class MessageType {
     GetChatLog,
     CrashProcess,
     CrashNotice,
+    ForwardMsg,
     Unknown
 };
 
@@ -41,9 +43,10 @@ struct Message {
 
 struct LogEntry {
     int term;
+    int messageID;
     std::string command;
     int confirmations = 1;
-    LogEntry(int t, std::string cmd): term(t), command(std::move(cmd)) {}
+    LogEntry(int t, int messageID, std::string cmd): term(t), messageID(messageID), command(std::move(cmd)) {}
 };
 
 class StateMachine {
@@ -64,9 +67,11 @@ private:
     int port;
     int base_port;
     int n_process;
+    int alive_n_process;
     int leader_id = -1;
     int votes_received = 0;
     int vote_for = -1;
+    int max_index = -1;
     bool reset_requested {false};
     bool stop {false};
     std::mutex mtx;
@@ -114,8 +119,10 @@ private:
     void sendMessageToNode(int node_id, const std::string& message, bool close_immediately = true, int timeout_ms = 1000, int max_retries = 3) {
         std::string state_str = (state == NodeState::Follower) ? "Follower" :
                                 (state == NodeState::Candidate) ? "Candidate" : "Leader";
-        std::cout << "Node " << id << " (State: " << state_str << ", Term: " << term << ") sending message to node " << node_id << " : " << message<< std::endl;
-
+        if (message.find("heartbeat") == std::string::npos) {                        
+            std::cout << "Node " << id << " (State: " << state_str << ", Term: " << term << ") sending message to node " << node_id << " : " << message<< std::endl;
+        }
+        
         std::string ip = "127.0.0.1";
         int port = base_port + node_id;
         int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -167,12 +174,20 @@ private:
             std::cerr << id << ": Failed to send message after " << max_retries << " attempts." << std::endl;
         }
     }
-
+    
+    void sendMessageToClient(int sock, std::string message){
+        std::cout << id << " send message : " << message << " to proxy" << std::endl;
+        message = message + "\n";
+        if(send(sock, message.c_str(), message.length(), 0) < 0) {
+            std::cerr << id << ": Failed to send message to client" << std::endl;
+        }
+    }
 
 public:
     RaftNode(int id, int n_process, int port)
     :state(NodeState::Follower), term(0), id(id), port(port), n_process(n_process), base_port(port - id), vote_for(-1), stop(false){
-        for (int i = 0; i < n_process; i++) {
+        alive_n_process = n_process;
+        for(int i = 0; i < n_process; i++){
             node_status[i] = true;
         }
     }
@@ -197,7 +212,6 @@ public:
     void listenForConnections() {
         int server_fd, new_socket;
         struct sockaddr_in address;
-        int opt = 1;
         int addrlen = sizeof(address);
 
         if((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
@@ -253,7 +267,19 @@ public:
         }
         else if (command == "AppendEntriesResponse") {
             msg.type = MessageType::AppendEntriesResponse;
-            iss >> msg.senderID >> msg.term >> msg.content;
+            iss >> msg.senderID >> msg.term;
+            std::getline(iss, msg.content);
+            if(!msg.content.empty() && msg.content[0] == ' ') {
+                msg.content.erase(0, 1);
+            }
+        }
+        else if (command == "ForwardMsg") {
+            msg.type = MessageType::ForwardMsg;
+            iss >> msg.messageID;
+            std::getline(iss, msg.content);
+            if(!msg.content.empty() && msg.content[0] == ' ') {
+                msg.content.erase(0, 1);
+            }
         }
         else if (command == "msg") {
             msg.type = MessageType::ClientMessage;
@@ -263,7 +289,7 @@ public:
                 msg.content.erase(0, 1);
             }
         }
-        else if (command == "get" && iss >> command && command == "chatLog") {
+        else if (command == "get") {
             msg.type = MessageType::GetChatLog;
         }
         else if (command == "crash") {
@@ -331,9 +357,9 @@ public:
                     std::unique_lock<std::mutex> lock(vr_mtx);
                     votes_received++;
                 }
-                std::cout << id << ": received vote: " << votes_received << " out of " << (n_process / 2 + 1) << " needed with term " << msg.term << std:: endl;
+                std::cout << id << ": received vote: " << votes_received << " out of " << (alive_n_process / 2 + 1) << " needed with term " << msg.term << std:: endl;
 
-                if(votes_received > n_process / 2) {
+                if(votes_received > alive_n_process / 2) {
                     becomeLeader();
                     // reset_requested = true;
                     // cv.notify_one();
@@ -352,7 +378,7 @@ public:
             std::unique_lock<std::mutex> lock(mtx);
             if(msg.term >= term) {
                 if(msg.term > term) {
-                    updateTerm(msg.term);
+                    updateTerm(msg.term); 
                 }
                 state = NodeState::Follower;
                 leader_id = msg.senderID;
@@ -363,21 +389,44 @@ public:
                     // std::string state_str = (state == NodeState::Follower) ? "Follower" :
                     //         (state == NodeState::Candidate) ? "Candidate" : "Leader";
                     // std::cout << "Node " << id << " (State: " << state_str << ", Term: " << term << ")"  << std::endl;
-                    std::cout << id << ": received heartbeat from node " << msg.senderID << std::endl;
-                    sendAppendEntriesResponse(msg.senderID, true);
+                    // std::cout << id << ": received heartbeat from node " << msg.senderID << std::endl;
+                    // sendAppendEntriesResponse(msg.senderID, true);
                 }
                 else {
                     std::istringstream iss(msg.content);
-                    std::string command;
-                    int entryTerm;
-                    while(iss >> entryTerm >> command) {
-                        if(log.empty() || log.back().term <= entryTerm) {
-                            log.push_back(LogEntry(entryTerm, command));
-                            sendAppendEntriesResponse(msg.senderID, true);
-                        } else {
+                    // std::string command;
+                    // int entryTerm;
+                    // while(iss >> entryTerm >> command) {
+                    //     if(log.empty() || log.back().term <= entryTerm) {
+                    //         log.push_back(LogEntry(entryTerm, command));
+                    //         sendAppendEntriesResponse(msg.senderID, true);
+                    //     } else {
+                    //         sendAppendEntriesResponse(msg.senderID, false);
+                    //     }
+                    // }
+                    std::string type;
+                    int message_term, index, message_id;
+                    iss >> type;
+                    if(type == "entry") {
+                        iss >> message_term >> index >> message_id;
+                        std::string content;
+                        std::getline(iss, content);
+                        if(!content.empty() && content[0] == ' '){
+                            content = content.substr(1);
+                        }
+                        if(log.empty() || log.back().term <= message_term) {
+                            log.push_back(LogEntry(message_term, message_id, content));
+                            sendAppendEntriesResponse(msg.senderID, true, index);
+                        }
+                        else {
                             sendAppendEntriesResponse(msg.senderID, false);
                         }
                     }
+                    else if(type == "commit") {
+                        iss >> index;
+                        applyLogToStateMachine(index);
+                    }
+
                 }
             }
             else {
@@ -388,61 +437,101 @@ public:
         }
     }
 
-    void sendAppendEntriesResponse(int leader_id, bool success) {
+    void sendAppendEntriesResponse(int leader_id, bool success, int index=-1) {
         std::string message = "AppendEntriesResponse " + std::to_string(id) + " " + std::to_string(term) + " " + (success ? "success" : "fail");
+        if (index != -1) {
+            message += " " + std::to_string(index); 
+        }
         sendMessageToNode(leader_id, message);
     }
 
     void handleAppendEntriesResponse(const Message& msg) {
-        // std::unique_lock<std::mutex> lock(mtx);
-        // if (msg.content.substr(0, 7) == "success") {
-        //     size_t space_pos = msg.content.find_last_of(' ');
-        //     if (space_pos != std::string::npos) {
-        //         std::string index_str = msg.content.substr(space_pos + 1);
-        //         if (!index_str.empty()) {
-        //             int index = std::stoi(index_str);
-        //             if (index < log.size()) {
-        //                 log[index].confirmations++;
-        //                 if (log[index].confirmations > n_process / 2) {
-        //                     log_cv.notify_all();
-        //                 }
-        //             }
-        //         }
-        //     }
-        // }
+        if (msg.content.substr(0, 7) == "success") {
+            size_t space_pos = msg.content.find_last_of(' ');
+            if (space_pos != std::string::npos) {
+                std::string index_str = msg.content.substr(space_pos + 1);
+                if (!index_str.empty()) {
+                    int index = std::stoi(index_str);
+                    if (index < log.size()) {
+                        log[index].confirmations++;
+                        if (log[index].confirmations > alive_n_process / 2) {
+                            log_cv.notify_all();
+                        }
+                    }
+                }
+            }
+        }
     }
 
     void applyLogToStateMachine(int index) {
         if (index < log.size() && log[index].term == term) {
             state_machine.apply(log[index].command);
+            max_index = std::max(index, max_index);
+            log_cv.notify_all();
             std::cout << id << ": log entry applied at index " << index << ": " << log[index].command << std::endl;
         }
     }
 
-    void handleClientMessage(const Message& msg) {
+    void handleClientMessage(const Message& msg, int sock=-1) {
         try {
+            std::cout << id << ": try to handle message: " << msg.content << "from client" << std::endl;
             std::unique_lock<std::mutex> lock(mtx);
             if(state == NodeState::Leader) {
-                log.push_back(LogEntry(term, msg.content));
+                log.push_back(LogEntry(term, msg.messageID, msg.content));
                 int current_index = log.size() - 1;
+
+                log[current_index].confirmations = 1;
 
                 for(int i = 0; i < n_process; i++) {
                     if(node_status[i] == false) continue;
                     if(i != id) {
-                        sendAppendEntries(i, false);
+                        std::string content = "entry " + std::to_string(term) + " " + std::to_string(current_index) + " " + std::to_string(msg.messageID) + " " + msg.content;
+                        sendAppendEntries(i, false, content);
                     }
                 }
 
-                log_cv.wait(lock, [this, current_index](){return log[current_index].confirmations > n_process / 2; });
+                log_cv.wait(lock, [this, current_index](){return log[current_index].confirmations > alive_n_process / 2; });
                 applyLogToStateMachine(current_index);
+                for(int i = 0; i < n_process; i++) {
+                    if(node_status[i] == false) continue;
+                    if(i != id) {
+                        std::string content = "commit " + std::to_string(current_index);
+                        sendAppendEntries(i, false, content);
+                    }
+                }
+                if (sock != -1) {
+                    std::string response = "ack " + std::to_string(msg.messageID) + " " + std::to_string(current_index);
+                    sendMessageToClient(sock, response);
+                }
+
+            }
+            else {
+                std::string forward_message = "ForwardMsg " + std::to_string(msg.messageID) + msg.content; 
+                int current_index = log.size();
+                sendMessageToNode(leader_id, forward_message);
+                log_cv.wait(lock, [this, current_index](){ return max_index >= current_index; });
+                if(sock != -1) {
+                    std::string response = "ack " + std::to_string(msg.messageID) + " " + std::to_string(current_index);
+                    sendMessageToClient(sock, response);
+                }
+                
             }
         } catch (const std::exception& e) {
             std::cerr << "Exception in handleClientMessage: " << e.what() << std::endl;
         }
     }
 
-    void hamdleGetChatLog(int sock) {
-
+    void handleGetChatLog(int sock) {
+        std::ostringstream oss;
+        for(const auto& message : state_machine.chat_history) {
+            if (oss.tellp() > 0) {
+                oss << ",";
+            }
+            oss << message;
+        }
+        std::string chatLog = oss.str();
+        std::string message = "chatLog " + chatLog;
+        sendMessageToClient(sock, message);
     }
 
     void handleCrashProcess() {
@@ -465,40 +554,53 @@ public:
 
     void handleCrashNotice(const Message& msg) {
         node_status[msg.senderID] = false;
+        alive_n_process--;
     }
     void handleConnection(int sock) {
         char buffer[1024] {0};
-        read(sock, buffer, 1024);
-        Message msg = parseMessage(buffer);
-
-        switch(msg.type) {
-            case MessageType::RequestVote:
-                handleRequestVote(msg, sock);
+        while(true) {
+            read(sock, buffer, 1024);
+            Message msg = parseMessage(buffer);
+            bool from_proxy = false;
+            switch(msg.type) {
+                case MessageType::RequestVote:
+                    handleRequestVote(msg, sock);
+                    break;
+                case MessageType::VoteResult:
+                    handleVoteResult(msg);
+                    break;
+                case MessageType::AppendEntries:
+                    handleAppendEntries(msg);
+                    break;
+                case MessageType::AppendEntriesResponse:
+                    handleAppendEntriesResponse(msg);
+                    break;
+                case MessageType::ClientMessage:
+                    handleClientMessage(msg, sock);
+                    from_proxy = true;
+                    break;
+                case MessageType::ForwardMsg:
+                    handleClientMessage(msg);
+                    break;
+                case MessageType::GetChatLog:
+                    handleGetChatLog(sock);
+                    from_proxy = true;
+                    break;
+                case MessageType::CrashProcess:
+                    handleCrashProcess();
+                    from_proxy = true;
+                    break;
+                case MessageType::CrashNotice:
+                    handleCrashNotice(msg);
+                    break;
+                default:
+                    std::cerr << id << ": received unknown message type." << std::endl;
+            }
+            if(!from_proxy){
                 break;
-            case MessageType::VoteResult:
-                handleVoteResult(msg);
-                break;
-            case MessageType::AppendEntries:
-                handleAppendEntries(msg);
-                break;
-            case MessageType::AppendEntriesResponse:
-                handleAppendEntriesResponse(msg);
-                break;
-            case MessageType::ClientMessage:
-                handleClientMessage(msg);
-                break;
-            case MessageType::GetChatLog:
-                hamdleGetChatLog(sock);
-                break;
-            case MessageType::CrashProcess:
-                handleCrashProcess();
-                break;
-            case MessageType::CrashNotice:
-                handleCrashNotice(msg);
-                break;
-            default:
-                std::cerr << id << ": received unknown message type." << std::endl;
+            }
         }
+        close(sock);
     }
 
     
@@ -533,7 +635,7 @@ public:
         }
     }
 
-    void sendAppendEntries(int node_id, bool heartbeat = false) {
+    void sendAppendEntries(int node_id, bool heartbeat, const std::string& content = "") {
         try {
             std::string message;
             if (heartbeat) {
@@ -541,10 +643,7 @@ public:
             } else {
                 std::ostringstream oss;
                 oss << "AppendEntries " << id << " " << term << " ";
-                std::lock_guard<std::mutex> lock(mtx);
-                for (const auto& entry : log) {
-                    oss << entry.term << " " << entry.command << " ";
-                }
+                oss << content;
                 message = oss.str();
             }
             sendMessageToNode(node_id, message);
