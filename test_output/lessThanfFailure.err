@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/Users/passerby/Documents/Semester2/DistributedSystem/HW4/proxy.py", line 204, in <module>
+    main()
+  File "/Users/passerby/Documents/Semester2/DistributedSystem/HW4/proxy.py", line 141, in main
+    exit()
+  File "/Users/passerby/Documents/Semester2/DistributedSystem/HW4/proxy.py", line 103, in exit
+    for k in threads:
+RuntimeError: dictionary changed size during iteration
