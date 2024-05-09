@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/Users/passerby/Documents/Semester2/DistributedSystem/HW4/proxy.py", line 204, in <module>
+    main()
+  File "/Users/passerby/Documents/Semester2/DistributedSystem/HW4/proxy.py", line 186, in main
+    time.sleep(0.1)
+KeyboardInterrupt

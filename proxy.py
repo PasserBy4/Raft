@@ -62,7 +62,7 @@ class ClientHandler(Thread):
                 try:
                     data = self.sock.recv(1024)
                     #sys.stderr.write(data)
-                    self.buffer += data
+                    self.buffer += data.decode('utf-8')
                 except:
                     #print sys.exc_info()
                     self.valid = False
@@ -72,7 +72,7 @@ class ClientHandler(Thread):
 
     def send(self, s):
         if self.valid:
-            self.sock.send(str(s) + '\n')
+            self.sock.send((str(s) + '\n').encode('utf-8'))
 
     def close(self):
         try:

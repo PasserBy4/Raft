@@ -1,0 +1,4 @@
+#!/bin/bash
+# stopall.sh
+
+pkill -f ./process
